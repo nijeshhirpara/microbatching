@@ -7,20 +7,21 @@ import (
 
 // Job represents a unit of work to be processed.
 type Job struct {
-	ID   int         // Unique identifier for the job.
-	Data interface{} // Data associated with the job.
+	ID     int            // Unique identifier for the job.
+	Data   any            // Data associated with the job.
+	Result chan JobResult // Channel to send the result of the job.
 }
 
 // JobResult represents the result of a processed job.
 type JobResult struct {
-	JobID int         // ID of the job this result corresponds to.
-	Data  interface{} // Processed data from the job.
-	Error error       // Error encountered during processing, if any.
+	JobID int   // ID of the job this result corresponds to.
+	Data  any   // Processed data from the job.
+	Error error // Error encountered during processing, if any.
 }
 
 // BatchProcessor defines the interface for processing batches of jobs.
 type BatchProcessor interface {
-	ProcessBatch(jobs []Job) []JobResult // Method to process a batch of jobs and return their results.
+	ProcessBatch(jobs []any) []JobResult // Method to process a batch of jobs and return their results.
 }
 
 // MicroBatcher is the main struct that manages job submission and batch processing.
@@ -29,9 +30,7 @@ type MicroBatcher struct {
 	batchFrequency  time.Duration  // Frequency at which batches are processed.
 	batchProcessor  BatchProcessor // Processor that handles the batch processing.
 	jobs            []Job          // Slice to store submitted jobs.
-	results         []JobResult    // Slice to store results of processed jobs.
 	jobsMutex       sync.Mutex     // Mutex to protect access to the jobs slice.
-	resultsMutex    sync.Mutex     // Mutex to protect access to the results slice.
 	shutdownChannel chan struct{}  // Channel to signal shutdown.
 	wg              sync.WaitGroup // WaitGroup to wait for all goroutines to finish.
 }
@@ -43,7 +42,6 @@ func NewMicroBatcher(batchSize int, batchFrequency time.Duration, processor Batc
 		batchFrequency:  batchFrequency,
 		batchProcessor:  processor,
 		jobs:            make([]Job, 0, batchSize),
-		results:         make([]JobResult, 0),
 		shutdownChannel: make(chan struct{}),
 	}
 
@@ -54,7 +52,10 @@ func NewMicroBatcher(batchSize int, batchFrequency time.Duration, processor Batc
 }
 
 // SubmitJob submits a single job to be processed.
-func (mb *MicroBatcher) SubmitJob(job Job) JobResult {
+func (mb *MicroBatcher) SubmitJob(job Job) chan JobResult {
+	// Create a result channel for this job
+	job.Result = make(chan JobResult, 1)
+
 	// Lock the jobs slice to ensure thread-safe access
 	mb.jobsMutex.Lock()
 	mb.jobs = append(mb.jobs, job)
@@ -66,7 +67,7 @@ func (mb *MicroBatcher) SubmitJob(job Job) JobResult {
 		go mb.processBatch()
 	}
 
-	return JobResult{JobID: job.ID, Data: nil, Error: nil}
+	return job.Result
 }
 
 // startBatching starts the batching process.
@@ -100,13 +101,25 @@ func (mb *MicroBatcher) processBatch() {
 	mb.jobs = make([]Job, 0, mb.batchSize)
 	mb.jobsMutex.Unlock()
 
-	// Process the batch and get results
-	results := mb.batchProcessor.ProcessBatch(jobsToProcess)
+	// Extract job data for processing
+	jobData := make([]any, len(jobsToProcess))
+	for i, job := range jobsToProcess {
+		jobData[i] = job.Data
+	}
 
-	// Store the results
-	mb.resultsMutex.Lock()
-	mb.results = append(mb.results, results...)
-	mb.resultsMutex.Unlock()
+	// Process the batch and get results
+	results := mb.batchProcessor.ProcessBatch(jobData)
+
+	// Send the results back through their respective channels
+	for _, result := range results {
+		for _, job := range jobsToProcess {
+			if job.ID == result.JobID {
+				job.Result <- result
+				close(job.Result)
+				break
+			}
+		}
+	}
 }
 
 // Shutdown shuts down the MicroBatcher after processing all remaining jobs.
@@ -115,11 +128,4 @@ func (mb *MicroBatcher) Shutdown() {
 	close(mb.shutdownChannel)
 	// Wait for the batching goroutine to finish
 	mb.wg.Wait()
-}
-
-// GetResults returns the processed job results.
-func (mb *MicroBatcher) GetResults() []JobResult {
-	mb.resultsMutex.Lock()
-	defer mb.resultsMutex.Unlock()
-	return mb.results
 }
