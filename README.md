@@ -1,13 +1,17 @@
 # MicroBatching Library
 
-MicroBatching is a library for processing individual tasks in small batches. This can improve throughput by reducing the number of requests made to a downstream system.
+The `microbatching` package provides a framework for managing and processing jobs in batches. This is useful for systems that need to process a high volume of jobs efficiently by grouping them into batches and processing each batch at a defined frequency or when a batch size is reached.
 
 ### Features
 
-- Submit a single job and get a result.
-- Process accepted jobs in batches using a `BatchProcessor`.
 - Configure the batching behavior (batch size and batch frequency).
+- Submit a single job and get a result.
+- Create batches either when a specified batch size is reached or after a fixed interval.
+- Process jobs in batches using a `BatchProcessor`.
+- Ensure unique job IDs to avoid conflicts.
+- Ensure uniqueness in batch processing to handle concurrency
 - Graceful shutdown that ensures all previously accepted jobs are processed.
+- Logging to track job submission and batch processing.
 
 ### Installation
 
@@ -19,29 +23,32 @@ go get github.com/yourusername/microbatch
 
 ### Usage
 
-#### Define a BatchProcessor
+#### Creating a Batch Processor
 
-First, define a type that implements the BatchProcessor interface. This interface requires a single method, ProcessBatch, that takes a slice of jobs and returns a slice of JobResult.
+First, define a type that implements the `BatchProcessor` interface. 
 
 ```go
 package main
 
 import (
-    "fmt"
-    "microbatch"
+	"github.com/nijeshhirpara/microbatching"
+	"github.com/google/uuid"
 )
 
-// MyBatchProcessor is a simple implementation of the BatchProcessor interface.
-type MyBatchProcessor struct{}
+type StringProcessor struct{}
 
-// ProcessBatch processes a batch of jobs and returns their results.
-func (bp *MyBatchProcessor) ProcessBatch(jobs []string) []microbatch.JobResult[string] {
-    results := make([]microbatch.JobResult[string], len(jobs))
-    for i, job := range jobs {
-        results[i] = microbatch.JobResult[string]{JobID: i, Data: fmt.Sprintf("Processed: %v", job), Error: nil}
-    }
-    return results
+func (sp *StringProcessor) ProcessBatch(batchID uuid.UUID, jobIDs []uuid.UUID, jobs []string) []microbatching.JobResult[string] {
+	results := make([]microbatching.JobResult[string], len(jobs))
+	for i, jobID := range jobIDs {
+		results[i] = microbatching.JobResult[string]{
+			JobID: jobID,
+			Data:  jobs[i], // Processed data (mock implementation)
+			Error: nil,     // Assume no errors
+		}
+	}
+	return results
 }
+
 ```
 
 #### Create a MicroBatcher
@@ -52,29 +59,38 @@ Create an instance of `MicroBatcher` with the desired batch size, batch frequenc
 package main
 
 import (
-    "fmt"
-    "time"
-    "microbatch"
+	"log"
+	"time"
+
+	"github.com/nijeshhirpara/microbatching"
 )
 
 func main() {
-    processor := &MyBatchProcessor{}
-    batcher := microbatch.NewMicroBatcher[string](5, 2*time.Second, processor)
+	processor := &StringProcessor{}
+	batchSize := 5
+	batchFrequency := 2 * time.Second
 
-    // Submit jobs to the batcher
-    for i := 0; i < 20; i++ {
-        job := microbatch.Job[string]{ID: i, Data: fmt.Sprintf("JobData %d", i)}
-        resultChan := batcher.SubmitJob(job)
-        go func(jobID int, resultChan chan microbatch.JobResult[string]) {
-            result := <-resultChan
-            fmt.Printf("Job ID: %d, Result: %v\n", result.JobID, result.Data)
-        }(i, resultChan)
-    }
+	batcher := microbatching.NewMicroBatcher[string](batchSize, batchFrequency, processor)
 
-    // Allow some time for processing
-    time.Sleep(10 * time.Second)
-    // Shutdown the batcher and wait for all jobs to be processed
-    batcher.Shutdown()
+	// Submit jobs
+	for i := 0; i < 10; i++ {
+		resultChan, err := batcher.SubmitJob("job data")
+		if err != nil {
+			log.Fatalf("Failed to submit job: %v", err)
+		}
+		go func() {
+			result := <-resultChan
+			if result.Error != nil {
+				log.Printf("Job failed: %v", result.Error)
+			} else {
+				log.Printf("Job completed: %v", result.Data)
+			}
+		}()
+	}
+
+	// Shutdown the batcher after some time
+	time.Sleep(10 * time.Second)
+	batcher.Shutdown()
 }
 ```
 
@@ -83,28 +99,82 @@ func main() {
 ### Job[T any]
 Represents a unit of work to be processed.
 
-- ID: Unique identifier for the job.
-- Data: Data associated with the job.
-- Result: Channel to send the result of the job.
+```go
+type Job[T any] struct {
+	ID     uuid.UUID         // Unique identifier for the job.
+	Data   T                 // Data associated with the job.
+	Result chan JobResult[T] // Channel to send the result of the job.
+}
+```
 
 ### JobResult[T any]
 
 Represents the result of a processed job.
 
-- JobID: ID of the job this result corresponds to.
-- Data: Processed data from the job.
-- Error: Error encountered during processing, if any.
+```go
+type JobResult[T any] struct {
+	JobID uuid.UUID // ID of the job this result corresponds to.
+	Data  T         // Processed data from the job.
+	Error error     // Error encountered during processing, if any.
+}
+```
 
 ### BatchProcessor[T any]
 
-Interface for processing batches of jobs.
+Defines the interface for processing batches of jobs.
 
-- `ProcessBatch(jobs []T) []JobResult[T]`: Method to process a batch of jobs and return their results.
+```go
+type BatchProcessor[T any] interface {
+	ProcessBatch(batchID uuid.UUID, jobIDs []uuid.UUID, jobs []T) []JobResult[T]
+}
+```
 
 ### MicroBatcher[T any]
 
-Main struct that manages job submission and batch processing.
+Manages job submission and batch processing.
 
-- `NewMicroBatcher(batchSize int, batchFrequency time.Duration, processor BatchProcessor[T]) *MicroBatcher[T]`: Creates a new MicroBatcher.
-- `SubmitJob(job Job[T]) chan JobResult[T]`: Submits a single job to be processed.
-- `Shutdown()`: Shuts down the MicroBatcher after processing all remaining jobs.
+#### `NewMicroBatcher`
+
+Creates a new MicroBatcher.
+
+```go
+func NewMicroBatcher[T any](batchSize int, batchFrequency time.Duration, processor BatchProcessor[T]) *MicroBatcher[T]
+```
+- `batchSize`: Maximum number of jobs to be included in a batch.
+- `batchFrequency`: Frequency at which batches are processed.
+- `processor`: Processor that handles the batch processing.
+
+#### `SubmitJob`
+
+Submits a single job to be processed.
+
+```go
+func (mb *MicroBatcher[T]) SubmitJob(data T) (chan JobResult[T], error)
+```
+- `data`: The data associated with the job.
+- Returns a channel to receive the job result and an error if the job could not be submitted.
+
+#### `SubmitJobAndWait`
+
+Submits a single job to be processed and wait for the results. It will timeout after passing wait tolerance.
+```go
+func (mb *MicroBatcher[T]) SubmitJobAndWait(data T, waitTolerance time.Duration) JobResult[T]
+```
+- `data`: The data associated with the job.
+- Returns job result which include an error if the job could not be submitted or timeout.
+
+#### `CountActiveBatches`
+
+Returns a count of active batches. It will help polling status of longer running batches.
+
+```go
+func (mb *MicroBatcher[T]) CountActiveBatches() int
+```
+
+#### `Shutdown`
+
+Shuts down the MicroBatcher after processing all remaining jobs.
+
+```go
+func (mb *MicroBatcher[T]) Shutdown()
+```

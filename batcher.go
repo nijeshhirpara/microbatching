@@ -1,131 +1,151 @@
 package microbatching
 
 import (
+	"errors"
+	"log"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Job represents a unit of work to be processed.
 type Job[T any] struct {
-	ID     int               // Unique identifier for the job.
+	ID     uuid.UUID         // Unique identifier for the job.
 	Data   T                 // Data associated with the job.
 	Result chan JobResult[T] // Channel to send the result of the job.
 }
 
 // JobResult represents the result of a processed job.
 type JobResult[T any] struct {
-	JobID int   // ID of the job this result corresponds to.
-	Data  T     // Processed data from the job.
-	Error error // Error encountered during processing, if any.
+	JobID uuid.UUID // ID of the job this result corresponds to.
+	Data  T         // Processed data from the job.
+	Error error     // Error encountered during processing, if any.
 }
 
 // BatchProcessor defines the interface for processing batches of jobs.
 type BatchProcessor[T any] interface {
-	ProcessBatch(jobs []T) []JobResult[T] // Method to process a batch of jobs and return their results.
+	ProcessBatch(batchID uuid.UUID, jobIDs []uuid.UUID, jobs []T) []JobResult[T] // Method to process a batch of jobs and return their results.
 }
 
-// MicroBatcher is the main struct that manages job submission and batch processing.
+// MicroBatcher is the main struct that manages job submission and batch processing using Batch instances.
 type MicroBatcher[T any] struct {
 	batchSize       int               // Maximum number of jobs to be included in a batch.
 	batchFrequency  time.Duration     // Frequency at which batches are processed.
 	batchProcessor  BatchProcessor[T] // Processor that handles the batch processing.
-	jobs            []Job[T]          // Slice to store submitted jobs.
-	jobsMutex       sync.Mutex        // Mutex to protect access to the jobs slice.
+	batches         []*batch[T]       // List of active batches.
 	shutdownChannel chan struct{}     // Channel to signal shutdown.
 	wg              sync.WaitGroup    // WaitGroup to wait for all goroutines to finish.
 }
 
-// NewMicroBatcher creates a new MicroBatcher.
+// NewMicroBatcher creates a new MicroBatcher and starts batching.
 func NewMicroBatcher[T any](batchSize int, batchFrequency time.Duration, processor BatchProcessor[T]) *MicroBatcher[T] {
 	mb := &MicroBatcher[T]{
 		batchSize:       batchSize,
 		batchFrequency:  batchFrequency,
 		batchProcessor:  processor,
-		jobs:            make([]Job[T], 0, batchSize),
+		batches:         []*batch[T]{},
 		shutdownChannel: make(chan struct{}),
 	}
 
-	// Start the batching goroutine
-	mb.wg.Add(1)
-	go mb.startBatching()
+	// Start batching process
+	mb.StartBatching()
+
 	return mb
 }
 
-// SubmitJob submits a single job to be processed.
-func (mb *MicroBatcher[T]) SubmitJob(job Job[T]) chan JobResult[T] {
-	// Create a result channel for this job
-	job.Result = make(chan JobResult[T], 1)
+// SubmitJob submits a job to be processed by the MicroBatcher.
+func (mb *MicroBatcher[T]) SubmitJob(data T) (chan JobResult[T], error) {
+	// Try to submit the job to an existing batch
+	for _, batch := range mb.batches {
+		resultChan, err := batch.submitJob(data)
 
-	// Lock the jobs slice to ensure thread-safe access
-	mb.jobsMutex.Lock()
-	mb.jobs = append(mb.jobs, job)
-	jobCount := len(mb.jobs)
-	mb.jobsMutex.Unlock()
-
-	// If the batch size is reached, process the batch immediately
-	if jobCount >= mb.batchSize {
-		go mb.processBatch()
+		// Find next batch in the case of ErrBatchFull
+		switch err {
+		case nil:
+			return resultChan, nil
+		case ErrBatchFull:
+			log.Printf("Batch %s is full. Trying next batch.", batch.ID.String())
+			continue
+		default:
+			return nil, err
+		}
 	}
 
-	return job.Result
+	// Create a new batch if no existing batch has space
+	newBatchID := uuid.New()
+	newBatch := newBatch(newBatchID, mb.batchProcessor, mb.batchSize)
+	mb.batches = append(mb.batches, newBatch)
+
+	log.Printf("Job submitted to new batch. BatchID: %s, Batch size: 1", newBatchID.String())
+	resultChan, err := newBatch.submitJob(data)
+	if err != nil {
+		return nil, err
+	}
+
+	return resultChan, nil
 }
 
-// startBatching starts the batching process.
-func (mb *MicroBatcher[T]) startBatching() {
-	defer mb.wg.Done()
-	ticker := time.NewTicker(mb.batchFrequency)
-	defer ticker.Stop()
+// Function to submit a job and wait for the result.
+func (mb *MicroBatcher[T]) SubmitJobAndWait(data T, waitTolerance time.Duration) JobResult[T] {
+	resultCh, err := mb.SubmitJob(data)
+	if err != nil {
+		return JobResult[T]{Error: err}
+	}
 
+	// Retry until result is available or timeout is reached.
+	timeout := time.After(waitTolerance)
 	for {
 		select {
-		case <-ticker.C:
-			// Process the batch on each tick
-			mb.processBatch()
-		case <-mb.shutdownChannel:
-			// Process any remaining jobs on shutdown
-			mb.processBatch()
-			return
+		case result := <-resultCh:
+			return result
+		case <-timeout:
+			log.Printf("Timeout waiting for job with data %v to be processed", data)
+			return JobResult[T]{Error: errors.New("timeout")}
+		default:
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
 
-// processBatch processes the current batch of jobs.
-func (mb *MicroBatcher[T]) processBatch() {
-	mb.jobsMutex.Lock()
-	if len(mb.jobs) == 0 {
-		mb.jobsMutex.Unlock()
-		return
-	}
-	// Copy the current jobs to process
-	jobsToProcess := mb.jobs
-	mb.jobs = make([]Job[T], 0, mb.batchSize)
-	mb.jobsMutex.Unlock()
+// StartBatching starts the batching process for all active batches.
+func (mb *MicroBatcher[T]) StartBatching() {
+	mb.wg.Add(1)
+	go func() {
+		defer mb.wg.Done()
+		ticker := time.NewTicker(mb.batchFrequency)
+		defer ticker.Stop()
 
-	// Extract job data for processing
-	jobData := make([]T, len(jobsToProcess))
-	for i, job := range jobsToProcess {
-		jobData[i] = job.Data
-	}
-
-	// Process the batch and get results
-	results := mb.batchProcessor.ProcessBatch(jobData)
-
-	// Send the results back through their respective channels
-	for _, result := range results {
-		for _, job := range jobsToProcess {
-			if job.ID == result.JobID {
-				job.Result <- result
-				close(job.Result)
-				break
+		for {
+			select {
+			case <-ticker.C:
+				// Process batches on each tick
+				for _, batch := range mb.batches {
+					batch.processBatch()
+				}
+			case <-mb.shutdownChannel:
+				// Process any remaining jobs on shutdown
+				for _, batch := range mb.batches {
+					batch.processBatch()
+				}
+				return
 			}
 		}
-	}
+	}()
 }
 
-// Shutdown shuts down the MicroBatcher after processing all remaining jobs.
+// Shutdown shuts down the MicroBatcher and all active batches.
 func (mb *MicroBatcher[T]) Shutdown() {
-	// Signal the shutdown
+	log.Println("Shutting down MicroBatcher and all active batches.")
 	close(mb.shutdownChannel)
-	// Wait for the batching goroutine to finish
 	mb.wg.Wait()
+	log.Println("MicroBatcher shutdown complete.")
 }
+
+// CountActiveBatches returns a count of active batches.
+func (mb *MicroBatcher[T]) CountActiveBatches() int {
+	return len(mb.batches)
+}
+
+// ErrBatchFull is returned when a job cannot be submitted to a batch because it is full.
+var ErrBatchFull = errors.New("batch is full")
